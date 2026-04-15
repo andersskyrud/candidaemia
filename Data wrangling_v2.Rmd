@@ -1,0 +1,668 @@
+---
+title: "Data wrangling for the candidaemia study"
+output: html_notebook
+---
+
+# Setup
+
+```{r setup}
+
+# Load packages
+pacman::p_load(
+  dplyr, 
+  readr,  
+  stringr,
+  tidylog,
+  lubridate,
+  readxl,
+  consort
+  )
+
+# Set file paths
+path <- "K:/Sensitivt/Forskning/24-19410_Candidemistudie/Data"
+file_unilab <- file.path(path, "Uttrekk samlet.csv")
+file_2008 <- file.path(path, "Uttrekk 2008.csv")
+
+```
+
+# Load and clean microbiology
+
+```{r load and clean microbiology}
+
+# Load and clean Unilab samlet (2009–2024) 
+
+unilab_data_raw <- read_delim(
+  file_unilab,
+  delim = ";",
+  locale = locale(encoding = "ISO-8859-1"),
+  show_col_types = FALSE,
+  trim_ws = TRUE
+) %>%
+  transmute(
+    f_nr = str_pad(as.character(Fødselsnr), width = 11, pad = "0"),
+    prøvedato = `Tatt dato`,
+    rekvirent = Rekvirentnavn,
+    mikrobe = Mikrobe,
+    mic_ap = `AP_E (MIC/MM)`,
+    mic_and = `AND_E (MIC/MM)`,
+    mic_cs = `CS_E (MIC/MM)`,
+    mic_fl = `FL_E (MIC/MM)`,
+    mic_it = `IT_E (MIC/MM)`,
+    mic_myc = `MYC_E (MIC/MM)`,
+    mic_vo = `VO_E (MIC/MM)`
+  ) 
+
+fc_invalid_fnr <- unilab_data_raw %>%
+  filter(!str_detect(f_nr, "^[0-9]{11}$"))
+
+unilab_data <- unilab_data_raw %>%
+  filter(str_detect(f_nr, "^[0-9]{11}$"))
+
+# Load and clean 2008 data 
+
+data_2008 <- read_delim(
+  file_2008,
+  delim = ";",
+  locale = locale(encoding = "ISO-8859-1"),
+  show_col_types = FALSE,
+  trim_ws = TRUE
+) %>%
+  filter(str_detect(Fødselsnr, "^[0-9]{10,11}$")) %>%
+  transmute(
+    f_nr = str_pad(as.character(Fødselsnr), width = 11, pad = "0"),
+    prøvedato = Tatt,
+    rekvirent = Rekvirent,
+    mikrobe = Mikrobe,
+    mic_ap   = as.numeric(str_replace(`Amfotericin B-Etest`, ",", ".")),
+    mic_and  = as.numeric(str_replace(`Andiulafungin-E test`, ",", ".")),
+    mic_cs   = as.numeric(str_replace(`Caspofungin-Etest`, ",", ".")),
+    mic_fl   = as.numeric(str_replace(`Fluconazole-Etest`, ",", ".")),
+    mic_myc  = as.numeric(str_replace(`Micafungin-Etest`, ",", ".")),
+    mic_vo   = as.numeric(str_replace(`Voriconazole-Etest`, ",", "."))
+  )
+
+# Combine and remove exact duplicates 
+
+candida_raw <- bind_rows(unilab_data, data_2008) %>%
+  mutate(
+    prøvedato = as.Date(prøvedato, format = "%d.%m.%Y")
+  ) 
+
+fc_outside_period <- candida_raw %>%
+  filter(prøvedato < as.Date("2008-01-01") |
+         prøvedato > as.Date("2024-12-31"))
+
+candida_raw <- candida_raw %>%
+  filter(prøvedato >= as.Date("2008-01-01") & prøvedato <= as.Date("2024-12-31")) %>%
+  distinct()
+
+fc_0_raw <- candida_raw
+
+```
+
+# Microbe names and categories
+
+```{r Microbe names and categories}
+
+# Filter to Candida spp. only, standardise and classify 
+
+candida_clean <- candida_raw %>%
+  # Clean and standardise microbe names
+  mutate(
+    mikrobe_clean = str_trim(tolower(mikrobe)),
+    mikrobe_std = case_when(
+      mikrobe_clean == "candida albicans"         ~ "CAALBI",
+      mikrobe_clean == "candida glabrata"         ~ "CAGLAB",
+      mikrobe_clean == "candida tropicalis"       ~ "CATROP",
+      mikrobe_clean == "candida parapsilosis"     ~ "CAPARA",
+      mikrobe_clean == "candida krusei"           ~ "CAKRUS",
+      mikrobe_clean == "candida kefyr"            ~ "CAKEFY",
+      mikrobe_clean == "candida dublinensis"      ~ "CADUBL",
+      TRUE ~ toupper(mikrobe) 
+    )
+  ) 
+
+fc_non_candida <- candida_clean %>%
+  filter(!str_starts(mikrobe_std, "CA"))
+
+candida_clean <- candida_clean %>%
+  # Filter to Candida spp. only
+  filter(str_starts(mikrobe_std, "CA")) %>%
+  # Classify into two and six categories
+  mutate(
+    mikro_kat2 = case_when(
+      mikrobe_std == "CAALBI" ~ "Candida albicans",
+      TRUE ~ "Candida non-albicans"
+    ),
+    mikro_kat6 = case_when(
+      mikrobe_std == "CAALBI" ~ "Candida albicans",
+      mikrobe_std == "CAGLAB" ~ "Candida glabrata",
+      mikrobe_std == "CATROP" ~ "Candida tropicalis",
+      mikrobe_std == "CAPARA" ~ "Candida parapsilosis",
+      mikrobe_std == "CAKRUS" ~ "Candida krusei",
+      TRUE ~ "Others"
+    )
+  )
+
+fc_1_candida <- candida_clean
+
+
+```
+
+# Hospital trust
+
+```{r hospital trust}
+
+# Create a new variable with the mapped health trust names using case_when
+candida_clean <- candida_clean %>%
+  mutate(health_trust = case_when(
+    rekvirent == "Sykehuset i Vestfold HF Tønsberg" ~ "Sykehuset i Vestfold HF",
+    rekvirent == "Helse Møre og Romsdal HF Ålesund" ~ "Helse Møre og Romsdal HF",
+    rekvirent == "Universitetssykehuset Nord-Norge Tromsø" ~ "Universitetssykehuset Nord-Norge HF",
+    rekvirent == "Nordlandssykehuset HF Bodø" ~ "Nordlandssykehuset HF",
+    rekvirent == "Sørlandet sykehus HF Kristiansand" ~ "Sørlandet sykehus HF",
+    rekvirent == "Sykehuset Østfold Senter for lab." ~ "Sykehuset Østfold HF",
+    rekvirent == "Ullevål universitetssykehus" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Aker universitetssykehus" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Akershus universitetssykehus HF" ~ "Akershus universitetssykehus HF",
+    rekvirent == "Haukeland universitetssjukehus" ~ "Helse Bergen HF",
+    rekvirent == "Sykehuset i Levanger" ~ "Helse Nord-Trøndelag HF",
+    rekvirent == "Vestre Viken HF Bærum sykehus" ~ "Vestre Viken HF",
+    rekvirent == "Mikrobiologisk institutt" ~ "Oslo universitetssykehus HF",
+    rekvirent == "St. Olavs Hospital HF Trondheim" ~ "St. Olavs hospital HF",
+    rekvirent == "Helse Møre og Romsdal HF Molde" ~ "Helse Møre og Romsdal HF",
+    rekvirent == "Sykehuset Innlandet HF Lillehammer" ~ "Sykehuset Innlandet HF",
+    rekvirent == "Sykehuset Østfold, Fredrikstad" ~ "Sykehuset Østfold HF",
+    rekvirent == "Helse Stavanger HF" ~ "Helse Stavanger HF",
+    rekvirent == "Vestre Viken HF Drammen sykehus" ~ "Vestre Viken HF",
+    rekvirent == "Helse Fonna HF Haugesund" ~ "Helse Fonna HF",
+    rekvirent == "Helse Førde HF Førde" ~ "Helse Førde HF",
+    rekvirent == "Barnesykdommer, Sengepost 4, Barneklinikken" ~ "Oslo universitetssykehus HF",
+    rekvirent == "A5 (Kir) (montebello)" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Helse Nord-Trøndelag HF Levanger" ~ "Helse Nord-Trøndelag HF",
+    rekvirent == "Generell intensiv enhet, Anestesiavdelingen" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Mikrobiologisk avd., Radiumhospitalet" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Enhet for bakteriologi 2 Ullevål" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Enhet for bakteriologi Rikshospitalet" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Enhet for bakteriologi 1 Ullevål" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Vestre Viken HF Ringerike sykehus" ~ "Vestre Viken HF",
+    rekvirent == "Bakteriologisk enhet, AK" ~ "Oslo universitetssykehus HF", #?
+    rekvirent == "Generell intensiv, Rikshospitalet" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Sykehuset Østfold HF Kalnes" ~ "Sykehuset Østfold HF",
+    rekvirent == "Sørlandet sykehus Kristiansand" ~ "Sørlandet sykehus HF",
+    rekvirent == "Gastrokir/uro. sengepost, Rikshospitalet" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Sengepost revma/infeksjon, Rikshospitalet" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Helsehuset Fredrikstad kommune" ~ "Sykehuset Østfold HF",
+    rekvirent == "UKJENT REKVIRENT" ~ "Unknown",
+    rekvirent == "Sykehuset Østfold, Kalnes" ~ "Sykehuset Østfold HF",
+    rekvirent == "Nyfødtintensiv, Rikshospitalet" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Sengepost nyre-gastro medisin, Rikshospitalet" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Nordlandsykehuset Bodø" ~ "Nordlandssykehuset HF",
+    rekvirent == "Levanger" ~ "Helse Nord-Trøndelag HF",
+    rekvirent == "Lillehammer" ~ "Sykehuset Innlandet HF",
+    rekvirent == "AHUS" ~ "Akershus universitetssykehus HF",
+    rekvirent == "Ullevål" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Sykehuset Asker og Bærum" ~ "Vestre Viken HF",
+    rekvirent == "St. Olavs hospital" ~ "St. Olavs hospital HF",
+    rekvirent == "Sykehuset Østfold - Fredrikstad" ~ "Sykehuset Østfold HF",
+    rekvirent == "SIV" ~ "Sykehuset i Vestfold HF",
+    rekvirent == "Universitetssykehuset Nord-Norge" ~ "Universitetssykehuset Nord-Norge HF",
+    rekvirent == "Sørlandet sykehus - Kristiansand" ~ "Sørlandet sykehus HF",
+    rekvirent == "Haukeland" ~ "Helse Bergen HF",
+    rekvirent == "Haugesund Sykehus" ~ "Helse Fonna HF",
+    rekvirent == "Sykehuset Levanger" ~ "Helse Nord-Trøndelag HF",
+    rekvirent == "Telelab" ~ "Unknown",
+    rekvirent == "Ahus" ~ "Akershus universitetssykehus HF",
+    rekvirent == "Sykehuset Buskerud" ~ "Vestre Viken HF",
+    rekvirent == "Molde sjukehus" ~ "Helse Møre og Romsdal HF",
+    rekvirent == "Aker sykehus" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Helse Sunnmøre Ålesund" ~ "Helse Møre og Romsdal HF",
+    rekvirent == "Sykehuset i Vestfold Tønsberg" ~ "Sykehuset i Vestfold HF",
+    rekvirent == "Førde sentralsjukehus" ~ "Helse Førde HF",
+    rekvirent == "SUS" ~ "Helse Stavanger HF",
+    rekvirent == "DNR" ~ "Oslo universitetssykehus HF", #?
+    rekvirent == "Sørlandet sykehus - Arendal" ~ "Sørlandet sykehus HF",
+    rekvirent == "Rikshospitalet" ~ "Oslo universitetssykehus HF",
+    rekvirent == "Vestre Viken HF Ringerike Sykehus" ~ "Vestre Viken HF",
+    rekvirent == "Sengepost A5, Radiumhospitalet" ~ "Oslo universitetssykehus HF",
+    TRUE ~ NA_character_
+  ))
+
+```
+
+
+# S, I, R classifications based on EUCAST breakpoints
+
+```{r EUCAST}
+
+candida_clean <- candida_clean %>%
+  mutate(
+
+    # Amfotericin B
+    EUCAST_ap = case_when(
+      is.na(mic_ap) ~ NA_character_,
+      mikrobe_std %in% c("CAALBI", "CADUBL", "CAGLAB", "CAKRUS", "CAPARA", "CATROP") & mic_ap <= 1 ~ "S",
+      mikrobe_std %in% c("CAALBI", "CADUBL", "CAGLAB", "CAKRUS", "CAPARA", "CATROP") & mic_ap > 1 ~ "R",
+      TRUE ~ NA_character_
+    ),
+
+    # Anidulafungin (species-specific breakpoints)
+    EUCAST_and = case_when(
+      is.na(mic_and) ~ NA_character_,
+
+      mikrobe_std == "CAALBI" & mic_and <= 0.016 ~ "S",
+      mikrobe_std == "CAALBI" & mic_and > 0.016 ~ "R",
+
+      mikrobe_std == "CADUBL" & mic_and <= 0.03 ~ "S",
+      mikrobe_std == "CADUBL" & mic_and > 0.03 ~ "R",
+
+      mikrobe_std %in% c("CAGLAB", "CAKRUS", "CATROP") & mic_and <= 0.06 ~ "S",
+      mikrobe_std %in% c("CAGLAB", "CAKRUS", "CATROP") & mic_and > 0.06 ~ "R",
+
+      mikrobe_std == "CAPARA" & mic_and <= 4 ~ "S",
+      mikrobe_std == "CAPARA" & mic_and > 4 ~ "R",
+
+      TRUE ~ NA_character_
+    ),
+
+    # Micafungin (species-specific)
+    EUCAST_myc = case_when(
+      is.na(mic_myc) ~ NA_character_,
+
+      mikrobe_std == "CAALBI" & mic_myc <= 0.03 ~ "S",
+      mikrobe_std == "CAALBI" & mic_myc > 0.03 ~ "R",
+
+      mikrobe_std == "CADUBL" & mic_myc <= 0.06 ~ "S",
+      mikrobe_std == "CADUBL" & mic_myc > 0.06 ~ "R",
+
+      mikrobe_std == "CAGLAB" & mic_myc <= 0.03 ~ "S",
+      mikrobe_std == "CAGLAB" & mic_myc > 0.03 ~ "R",
+
+      mikrobe_std == "CAPARA" & mic_myc <= 4 ~ "S",
+      mikrobe_std == "CAPARA" & mic_myc > 4 ~ "R",
+
+      mikrobe_std == "CATROP" & mic_myc <= 0.06 ~ "S",
+      mikrobe_std == "CATROP" & mic_myc > 0.06 ~ "R",
+
+      TRUE ~ NA_character_
+    ),
+
+    # Caspofungin: infer S only if both and+myc are S, there are no EUCAST breakpoints for R!
+    EUCAST_cs = case_when(
+      EUCAST_and == "S" & EUCAST_myc == "S" ~ "S",
+      TRUE ~ NA_character_
+    ),
+
+    # Fluconazole
+    EUCAST_fl = case_when(
+      is.na(mic_fl) ~ NA_character_,
+
+      mikrobe_std == "CAALBI" & mic_fl <= 2 ~ "S",
+      mikrobe_std == "CAALBI" & mic_fl > 4 ~ "R",
+      mikrobe_std == "CAALBI" & mic_fl > 2 & mic_fl <= 4 ~ "I",
+
+      mikrobe_std == "CADUBL" & mic_fl <= 2 ~ "S",
+      mikrobe_std == "CADUBL" & mic_fl > 4 ~ "R",
+      mikrobe_std == "CADUBL" & mic_fl > 2 & mic_fl <= 4 ~ "I",
+
+      mikrobe_std == "CAPARA" & mic_fl <= 2 ~ "S",
+      mikrobe_std == "CAPARA" & mic_fl > 4 ~ "R",
+      mikrobe_std == "CAPARA" & mic_fl > 2 & mic_fl <= 4 ~ "I",
+
+      mikrobe_std == "CATROP" & mic_fl <= 2 ~ "S",
+      mikrobe_std == "CATROP" & mic_fl > 4 ~ "R",
+      mikrobe_std == "CATROP" & mic_fl > 2 & mic_fl <= 4 ~ "I",
+
+      mikrobe_std == "CAGLAB" & mic_fl <= 0.001 ~ "S",
+      mikrobe_std == "CAGLAB" & mic_fl > 16 ~ "R",
+      mikrobe_std == "CAGLAB" ~ "I",
+
+      TRUE ~ NA_character_
+    ),
+
+    # Itraconazole
+    EUCAST_it = case_when(
+      is.na(mic_it) ~ NA_character_,
+
+      mikrobe_std == "CAALBI" & mic_it <= 0.06 ~ "S",
+      mikrobe_std == "CAALBI" & mic_it > 0.06 ~ "R",
+
+      mikrobe_std == "CADUBL" & mic_it <= 0.06 ~ "S",
+      mikrobe_std == "CADUBL" & mic_it > 0.06 ~ "R",
+
+      mikrobe_std == "CAPARA" & mic_it <= 0.125 ~ "S",
+      mikrobe_std == "CAPARA" & mic_it > 0.125 ~ "R",
+
+      mikrobe_std == "CATROP" & mic_it <= 0.125 ~ "S",
+      mikrobe_std == "CATROP" & mic_it > 0.125 ~ "R",
+
+      TRUE ~ NA_character_
+    ),
+
+    # Voriconazole
+    EUCAST_vo = case_when(
+      is.na(mic_vo) ~ NA_character_,
+
+      mikrobe_std == "CAALBI" & mic_vo <= 0.06 ~ "S",
+      mikrobe_std == "CAALBI" & mic_vo > 0.257 ~ "R",
+      mikrobe_std == "CAALBI" ~ "I",
+
+      mikrobe_std == "CADUBL" & mic_vo <= 0.067 ~ "S",
+      mikrobe_std == "CADUBL" & mic_vo > 0.257 ~ "R",
+      mikrobe_std == "CADUBL" ~ "I",
+
+      mikrobe_std == "CAPARA" & mic_vo <= 0.125 ~ "S",
+      mikrobe_std == "CAPARA" & mic_vo > 0.257 ~ "R",
+      mikrobe_std == "CAPARA" ~ "I",
+
+      mikrobe_std == "CATROP" & mic_vo <= 0.125 ~ "S",
+      mikrobe_std == "CATROP" & mic_vo > 0.257 ~ "R",
+      mikrobe_std == "CATROP" ~ "I",
+
+      TRUE ~ NA_character_
+    )
+  )
+
+
+```
+
+```{r age and sex}
+
+candida_clean <- candida_clean %>%
+  mutate(
+    # Extract day, month, and year parts from f_nr
+    birth_day = str_sub(f_nr, 1, 2),
+    birth_month = str_sub(f_nr, 3, 4),
+    birth_year_short = str_sub(f_nr, 5, 6),
+    # Determine the full birth year: If birth year is more than sample date, 19 is selected instead of 20
+    birth_year = if_else(
+      make_date(as.numeric(paste0("20", birth_year_short)), as.numeric(birth_month), as.numeric(birth_day)) > prøvedato,
+      as.numeric(paste0("19", birth_year_short)),
+      as.numeric(paste0("20", birth_year_short))
+    ), # The problem with this method is that no one can be more than 100 years old! We have now confirmed no one is over 100 years old in the study.
+    # Parse the full birth date
+    birth_date = make_date(birth_year, as.numeric(birth_month), as.numeric(birth_day)),
+    # Calculate age based on the birth date and sample date
+    age = floor(as.numeric(difftime(prøvedato, birth_date, units = "days")) / 365.25),
+    # Extract the ninth digit from f_nr to determine sex
+    sex = if_else(
+      as.numeric(str_sub(f_nr, 9, 9)) %% 2 == 0,
+      "female",
+      "male"
+    )
+  )
+
+```
+
+```{r pseudonymise}
+
+# Import Utvalg.csv into a new dataframe
+utvalg_data <- read_csv2(paste0(path, "/Utvalg.csv"))  # Using read_csv2 for semicolon delimiter
+
+# Ensure Fødselsnummer in utvalg_data is unique by filtering out duplicates
+utvalg_data <- utvalg_data %>%
+  distinct(Fødselsnummer, .keep_all = TRUE)
+
+# Perform a join operation to add Løpenummer to candida_clean
+candida_clean <- candida_clean %>%
+  left_join(utvalg_data, by = c("f_nr" = "Fødselsnummer"))
+
+fc_missing_pseudo <- candida_clean %>%
+  filter(is.na(Løpenummer))
+
+# Remove the f_nr column and rename Løpenummer to lopenr
+data <- candida_clean %>%
+  select(-f_nr, -Prøvedato, -birth_day, -birth_month, -birth_year_short, -birth_year, -rekvirent) %>%
+  rename(lopenr = Løpenummer) %>%
+  select(lopenr, everything())
+
+fc_2_pseudo <- data
+
+```
+
+# Clean and bind NPR data
+
+```{r clean and bind NPR data}
+
+# Set file paths
+path_npr <- "K:/Sensitivt/Forskning/24-19410_Candidemistudie/NPR"
+AVTaktivitet <- file.path(path_npr, "AVTaktivitet.xlsx")
+REHaktivitet <- file.path(path_npr, "REHaktivitet.xlsx")
+SOMaktivitet <- file.path(path_npr, "SOMaktivitet.xlsx")
+
+# Load the Excel files
+AVTaktivitet_data <- read_excel(
+  AVTaktivitet)
+
+REHaktivitet_data <- read_excel(
+  REHaktivitet)
+
+SOMaktivitet_data <- read_excel(
+  SOMaktivitet) 
+
+# Convert pasfylke to character in each dataframe
+AVTaktivitet_data <- AVTaktivitet_data %>%
+  mutate(pasfylke2 = as.character(pasfylke2))
+
+REHaktivitet_data <- REHaktivitet_data %>%
+  mutate(pasfylke2 = as.character(pasfylke2))
+
+combined_data <- bind_rows(AVTaktivitet_data, REHaktivitet_data, SOMaktivitet_data)
+
+```
+
+# Load date of death data
+
+```{r load date of death}
+
+dod_data <- read_delim(
+  "K:/Sensitivt/Forskning/24-19410_Candidemistudie/NPR/Personopplysningstabell.csv",
+  delim = ";",
+  col_types = cols(
+    doddato = col_date(format = "%Y-%m-%d")
+  )
+)
+
+```
+
+# Merge all data
+
+```{r merge}
+
+# Join combined_data and dod_data to stem data on lopenr
+full_data <- data %>%
+  left_join(combined_data, by = "lopenr") %>%
+  select(-doddato) %>% 
+  left_join(dod_data, by = "lopenr")
+
+```
+
+
+# Malignancies, transplantation, preterm, and case fatality
+
+```{r malignancies}
+
+full_data <- full_data %>%
+  # Create diagnosedato column
+  mutate(diagnosedato = case_when(
+    !is.na(utdato) ~ utdato,
+    !is.na(inndato) ~ inndato,
+    TRUE ~ NA
+  )) %>%
+  # Check for cancer diagnoses within 2 years before to 31 days after prøvedato
+  mutate(has_cancer = as.integer(case_when(
+    !is.na(diagnosedato) &
+    grepl("^[CD]", kodeverdi) &
+    diagnosedato >= (prøvedato - years(2)) &
+    diagnosedato <= (prøvedato + days(31)) ~ 1,
+    TRUE ~ 0
+  ))) %>% 
+  # Create preterm variable with temporal logic
+  mutate(preterm = case_when( # Check this more
+    # Within 2 years before to 31 days after prøvedato
+    diagnosedato >= (prøvedato - years(2)) &
+    diagnosedato <= (prøvedato + days(31)) & !is.na(kodeverdi) ~
+      case_when(
+        kodeverdi == "P072" ~ "Extremely preterm",
+        kodeverdi == "P073" ~ "Preterm",
+        TRUE ~ "Not preterm"
+      ),
+    TRUE ~ "Not preterm"
+  )) %>% 
+  # Create the transplantation variable with temporal logic
+  mutate(transplantation = case_when(
+    prosedyredato <= (prøvedato) & !is.na(kodeverdi) ~ # Once transplanted, always transplanted
+      case_when(
+        grepl("^RAG", kodeverdi) ~ "Transplantation",
+        TRUE ~ "No transplantation"
+      ),
+    TRUE ~ "No transplantation"
+  )) %>% 
+  # Create case_fatality variable
+  mutate(case_fatality = as.integer(case_when(
+    # If doddata is available and within 30 days of prøvedato
+    !is.na(doddato) &
+    doddato >= prøvedato &
+    doddato <= (prøvedato + days(30)) ~ 1,
+    TRUE ~ 0
+  ))) %>% 
+  mutate(case_fatality_days = if_else(case_fatality==1, as.integer(doddato-prøvedato), 30)) %>% 
+  mutate(resistant = as.integer(
+    if_else(
+      EUCAST_ap == "R" |
+      EUCAST_and == "R" |
+      EUCAST_myc == "R" |
+      EUCAST_cs == "R" |
+      EUCAST_fl == "R" |
+      EUCAST_it == "R" |
+      EUCAST_vo == "R",
+      1, 0, missing = 0
+    )
+  )) %>% 
+  mutate(fl_resistant = as.integer(
+    if_else(
+      EUCAST_fl == "R",
+      1, 0, missing = 0
+    )
+  )) %>% 
+  mutate(ec_resistant = as.integer( # anidulafungin, kaspofungin, micafungin
+    if_else(
+      EUCAST_and == "R" |
+      EUCAST_myc == "R" |
+      EUCAST_cs == "R",
+      1, 0, missing = 0
+    )
+  )) %>% 
+  mutate(year = year(prøvedato)) %>% 
+  mutate(age_cat = cut(age,
+                      breaks = c(seq(0, 100, by = 10)),
+                      labels = c("0-9", "10-19", "20-29", "30-39", "40-49",
+                                "50-59", "60-69", "70-79", "80-89", "90+"))) 
+
+```
+
+# Select cases
+
+```{r select}
+
+# Select variables and remove true duplicates
+
+full_data_selected <- full_data %>%
+  select(
+    lopenr, age, age_cat, sex, prøvedato, year, mikrobe_std, resistant, fl_resistant, ec_resistant,
+    mikro_kat2, mikro_kat6, doddato, case_fatality, case_fatality_days, has_cancer,
+    preterm, transplantation, health_trust,
+    EUCAST_ap, EUCAST_and, EUCAST_myc, EUCAST_cs, EUCAST_fl, EUCAST_it, EUCAST_vo
+  ) %>%
+  distinct()
+
+# Fill the 1's from cancer and transplantation and preterm to the rest of the observations on the same combination of lopenr+prøvedato
+
+full_data_selected <- full_data_selected %>%
+  group_by(lopenr, prøvedato) %>%
+  # Create new columns with max values for each group
+  mutate(
+    max_has_cancer = max(has_cancer, na.rm = TRUE),
+    max_preterm = if_else(any(preterm == "Extremely preterm"), "Extremely preterm",
+                         if_else(any(preterm == "Preterm"), "Preterm", "Not preterm")),
+    max_transplantation = if_else(any(transplantation == "Transplantation"), "Transplantation", "No transplantation")
+  ) %>%
+  ungroup() %>%
+  # Select the max columns and rename them back to original names
+  transmute(
+    lopenr, prøvedato, year, age, age_cat, sex, mikrobe_std, resistant, fl_resistant, ec_resistant,
+    mikro_kat2, mikro_kat6, doddato, case_fatality, case_fatality_days,
+    has_cancer = max_has_cancer, preterm = max_preterm,
+    transplantation = max_transplantation, health_trust,
+    EUCAST_ap, EUCAST_and, EUCAST_myc, EUCAST_cs, EUCAST_fl, EUCAST_it, EUCAST_vo
+  )
+
+# Deduplication
+
+full_data_dedup <- full_data_selected %>%
+  arrange(lopenr, prøvedato) %>%
+  group_by(lopenr, mikrobe_std) %>%
+  mutate(
+    # Identify previous sample date
+    prev_date = lag(prøvedato),
+    days_since_prev = as.numeric(prøvedato - prev_date),
+    # Create resistance profile for current and previous samples
+    current_resistance = paste(EUCAST_ap, EUCAST_and, EUCAST_myc,
+                             EUCAST_cs, EUCAST_fl, EUCAST_it, EUCAST_vo, sep = "_"),
+    prev_resistance = lag(paste(EUCAST_ap, EUCAST_and, EUCAST_myc,
+                              EUCAST_cs, EUCAST_fl, EUCAST_it, EUCAST_vo, sep = "_"))
+  ) %>%
+  # Mark episodes for removal
+  mutate(remove = ifelse(
+    !is.na(prev_date) &  # Has previous sample
+    days_since_prev <= 28 &  # Within 28 days
+    current_resistance == prev_resistance,  # Same resistance profile
+    1, 0
+  )) 
+  
+fc_duplicates <- full_data_dedup %>%
+  filter(
+    !is.na(prev_date) &
+    days_since_prev <= 28 &
+    current_resistance == prev_resistance
+  )
+
+full_data_dedup <- full_data_dedup %>%
+  # Keep episodes where either:
+  # 1. No previous sample within 28 days, OR
+  # 2. Resistance profile has changed
+  filter(remove == 0) %>%
+  select(-remove, -prev_date, -days_since_prev,
+         -current_resistance, -prev_resistance) %>%
+  ungroup()
+
+fc_3_final <- full_data_dedup
+
+```
+
+# Flowchart
+
+```{r flowchart}
+
+# Get counts from intermediate objects
+initial_count <- nrow(fc_0_raw)
+invalid_fnr_count <- nrow(fc_invalid_fnr)
+outside_period_count <- nrow(fc_outside_period)
+non_candida_count <- nrow(fc_non_candida)
+duplicate_count <- nrow(fc_duplicates)
+final_count <- nrow(fc_3_final)
+
+```
+
+# Save the data
+
+```{r save} 
+
+write_delim(
+  full_data_dedup,
+  file = file.path(path, "Full_data.csv"),
+  delim = ";"
+)
+
+```
+

@@ -1,0 +1,734 @@
+---
+title: "Analyses"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+# Setup
+
+```{r setup}
+
+# Load packages
+pacman::p_load(
+  tidyverse, 
+  knitr,
+  patchwork,
+  viridis, 
+  gt,
+  gtExtras,
+  gtsummary,
+  tidylog,
+  lubridate,
+  pheatmap,
+  janitor,
+  scales,
+  lme4,
+  broom.mixed,
+  geepack,
+  marginaleffects,
+  splines,
+  performance,
+  geepack,
+  DHARMa,
+  car,
+  sf,
+  scatterpie,
+  rnaturalearth,
+  rnaturalearthdata,
+  survival,
+  survminer,
+  gt,
+  openxlsx
+  )
+
+setwd("K:/Sensitivt/Forskning/24-19410_Candidemistudie")
+
+# Read the data
+data <- read_csv2("Data/Full_data.csv")
+
+# Merge preterm categories - too few in each of the preterm categories
+data <- data %>%
+  mutate(preterm = case_when(
+    preterm == "Preterm" | preterm == "Extremely preterm" ~ "Combined preterm",
+    TRUE ~ as.character(preterm)
+  ))
+
+# Ensure lopenr is a factor
+data$lopenr <- as.factor(data$lopenr)
+
+set_theme(theme_classic())
+
+```
+
+# Table 1
+
+```{r table 1}
+
+table1 <- data %>%
+  select(mikro_kat2, age, age_cat, sex, has_cancer, preterm, transplantation, resistant,  fl_resistant, ec_resistant, health_trust) %>%
+  tbl_summary(
+    by = mikro_kat2,  
+    type = list(
+      age ~ "continuous",  
+      age_cat ~ "categorical",
+      has_cancer ~ "categorical",  
+      preterm ~ "categorical",
+      transplantation ~ "categorical",
+      resistant ~ "categorical",
+      fl_resistant ~ "categorical", 
+      ec_resistant ~ "categorical",
+      sex ~ "categorical",
+      health_trust ~ "categorical"
+    ),
+    label = list(
+      age ~ "Age",
+      age_cat ~ "Age categories",
+      has_cancer ~ "Haematological malignancy",
+      preterm ~ "Preterm",
+      transplantation ~ "Stem cell transplantation",
+      resistant ~ "Any drug resistance",
+      fl_resistant ~ "Fluconazole resistance", 
+      ec_resistant ~ "Echinocandin resistance",
+      sex ~ "Sex",
+      health_trust ~ "Health trust"
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 0,
+    missing = "ifany",
+    percent = "row"
+  ) %>%
+  add_overall() %>%  
+  modify_header(label = "**Covariate**") %>%
+  bold_labels()
+
+table1
+
+# Save it
+# Convert to gt object
+gt_table1 <- as_gt(table1)
+
+# Save 
+gtsave(gt_table1, "table1.docx")
+
+```
+
+# Table 2
+
+```{r table 2}
+
+# Create the age group variable
+data <- data %>%
+  mutate(age_group = if_else(age < 65, "Younger (<65 years)", "Older (≥65 years)"))
+
+# Create Table 2
+table2 <- data %>%
+  select(age_group, mikro_kat6) %>%
+  tbl_summary(
+    by = age_group,
+    type = mikro_kat6 ~ "categorical",
+    statistic = mikro_kat6 ~ "{n} ({p}%)",
+    digits = all_continuous() ~ 2,
+    missing = "ifany",
+    label = mikro_kat6 ~ "Candida species"
+  ) %>%
+  add_overall() %>%
+  modify_header(label = "**Species**") %>%
+  modify_caption("**Table 2: Distribution of Candida species by age group**") %>%
+  bold_labels() %>%
+  bold_levels()
+
+# Print the table
+table2
+
+# Save it
+# Convert to gt object
+gt_table2 <- as_gt(table2)
+
+# Save 
+gtsave(gt_table2, "table2.docx")
+
+```
+
+```{r heatmap}
+
+# Prepare the data
+heatmap_data <- data %>%
+  filter(health_trust != "Unknown") %>%  # Remove unknown health trusts
+  group_by(health_trust, mikro_kat6) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  # Calculate proportions and total observations
+  group_by(health_trust) %>%
+  mutate(total = sum(count),
+         proportion = count / total * 100) %>%
+  ungroup()
+  
+heatmap_data$health_trust <- with(heatmap_data, reorder(health_trust, total))
+
+# Create the heatmap with magma color scale
+heatmap <- ggplot(heatmap_data, aes(x = mikro_kat6, y = health_trust, fill = proportion)) +
+  geom_tile() +
+  scale_fill_viridis(option = "plasma", direction = -1) +
+  labs(x = "Candida species", y = "Health trust") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r map}
+
+# Base map of Norway (projected)
+norway <- ne_countries(
+  country = "Norway",
+  scale = "medium",
+  returnclass = "sf"
+) %>%
+  st_transform(25833) %>%
+  st_crop(
+    xmin = -2e5,
+    xmax = 1.6e6,
+    ymin = 6.2e6,
+    ymax = 8.0e6
+  )
+
+# Add coordinates
+data_with_coords <- data %>%
+  mutate(
+    lon = case_when(
+      health_trust == "Akershus universitetssykehus HF" ~ 10.57,
+      health_trust == "Helse Nord-Trøndelag HF" ~ 11.30,
+      health_trust == "Helse Stavanger HF" ~ 5.43,
+      health_trust == "Helse Møre og Romsdal HF" ~ 6.15,
+      health_trust == "Oslo universitetssykehus HF" ~ 10.44,
+      health_trust == "Helse Bergen HF" ~ 5.19,
+      health_trust == "Sykehuset i Vestfold HF" ~ 10.41,
+      health_trust == "St. Olavs hospital HF" ~ 10.23,
+      health_trust == "Vestre Viken HF" ~ 10.12,
+      health_trust == "Universitetssykehuset Nord-Norge HF" ~ 18.57,
+      health_trust == "Nordlandssykehuset HF" ~ 14.38,
+      health_trust == "Sørlandet sykehus HF" ~ 7.59,
+      health_trust == "Sykehuset Østfold HF" ~ 11.06,
+      health_trust == "Helse Fonna HF" ~ 5.17,
+      health_trust == "Sykehuset Innlandet HF" ~ 10.28,
+      health_trust == "Helse Førde HF" ~ 5.86,
+      TRUE ~ NA_real_
+    ),
+    lat = case_when(
+      health_trust == "Akershus universitetssykehus HF" ~ 59.53,
+      health_trust == "Helse Nord-Trøndelag HF" ~ 63.70,
+      health_trust == "Helse Stavanger HF" ~ 58.58,
+      health_trust == "Helse Møre og Romsdal HF" ~ 62.47,
+      health_trust == "Oslo universitetssykehus HF" ~ 59.54,
+      health_trust == "Helse Bergen HF" ~ 60.23,
+      health_trust == "Sykehuset i Vestfold HF" ~ 59.27,
+      health_trust == "St. Olavs hospital HF" ~ 63.25,
+      health_trust == "Vestre Viken HF" ~ 59.44,
+      health_trust == "Universitetssykehuset Nord-Norge HF" ~ 69.39,
+      health_trust == "Nordlandssykehuset HF" ~ 67.28,
+      health_trust == "Sørlandet sykehus HF" ~ 58.08,
+      health_trust == "Sykehuset Østfold HF" ~ 59.17,
+      health_trust == "Helse Fonna HF" ~ 59.26,
+      health_trust == "Sykehuset Innlandet HF" ~ 61.70,
+      health_trust == "Helse Førde HF" ~ 61.45,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(health_trust != "Unknown")
+
+# Prepare health trust data
+trust_data <- data_with_coords %>%
+  group_by(health_trust) %>%
+  summarise(
+    lon = first(lon),
+    lat = first(lat),
+    albicans = sum(mikro_kat2 == "Candida albicans"),
+    non_albicans = sum(mikro_kat2 == "Candida non-albicans"),
+    .groups = "drop"
+  ) %>%
+  mutate(total = albicans + non_albicans)
+
+# Convert to sf and project
+trust_sf <- st_as_sf(
+  trust_data,
+  coords = c("lon", "lat"),
+  crs = 4326
+) %>%
+  st_transform(25833) %>%
+  mutate(
+    x = st_coordinates(.)[, 1],
+    y = st_coordinates(.)[, 2]
+  )
+
+# Manual nudges for South-East Norway
+trust_sf <- trust_sf %>%
+  mutate(
+    x_plot = case_when(
+      health_trust == "Oslo universitetssykehus HF" ~ x + 140000,
+      health_trust == "Akershus universitetssykehus HF" ~ x,
+      health_trust == "Helse Fonna HF" ~ x + 40000,
+      health_trust == "Vestre Viken HF" ~ x - 30000,
+      health_trust == "Sykehuset Østfold HF" ~ x + 70000,
+      health_trust == "Sykehuset i Vestfold HF" ~ x + 20000,
+      TRUE ~ x
+    ),
+    y_plot = case_when(
+      health_trust == "Oslo universitetssykehus HF" ~ y + 60000,
+      health_trust == "Akershus universitetssykehus HF" ~ y + 100000,
+      health_trust == "Helse Fonna HF" ~ y - 8000,
+      health_trust == "Vestre Viken HF" ~ y,
+      health_trust == "Sykehuset Østfold HF" ~ y - 15000,
+      health_trust == "Sykehuset i Vestfold HF" ~ y - 30000,
+      TRUE ~ y
+    )
+  )
+
+trust_plot <- trust_sf %>%
+  st_drop_geometry()
+
+# Leader lines (from true centroid to nudged pie)
+leader_lines <- trust_sf %>%
+  filter(x != x_plot | y != y_plot)
+
+# Map
+map <- ggplot() +
+  geom_sf(
+    data = norway,
+    fill = "grey95",
+    colour = "grey60"
+  ) +
+  geom_segment(
+    data = leader_lines,
+    aes(x = x, y = y, xend = x_plot, yend = y_plot),
+    linewidth = 0.3,
+    colour = "black"
+  ) +
+  geom_scatterpie(
+    data = trust_plot,
+    aes(x = x_plot, y = y_plot, r = sqrt(total) * 2500),
+    cols = c("albicans", "non_albicans"),
+    colour = "black",
+    linewidth = 0.3
+  ) +
+  ggrepel::geom_text_repel(
+    data = trust_plot,
+    aes(x = x_plot, y = y_plot, label = str_remove(health_trust, " HF$")),
+    size = 2.2,
+    point.size = sqrt(trust_plot$total) * 2500 / 2800,
+    min.segment.length = 0,
+    segment.size = 0.25,
+    box.padding = 0.4,
+    max.overlaps = Inf,
+    seed = 42
+  ) +
+  coord_sf() +
+  scale_fill_viridis(
+  discrete = TRUE,
+  name = "Species",
+  labels = c(
+    albicans = "Candida albicans",
+    non_albicans = "Candida non-albicans"
+  )
+  ) +
+  theme_void() +
+  theme(
+  )
+
+map
+
+```
+
+```{r Norway figure}
+
+# Create the combined plot using patchwork
+combined_plot <- (map / heatmap) +  # Vertical arrangement
+  plot_layout(heights = c(2, 1))  # Map gets 2/3 of space, heatmap 1/3
+
+# Save the combined plot as PNG
+ggsave(
+  "candidaemia_map_heatmap.png",
+  plot = combined_plot,
+  width = 12,
+  height = 14,
+  units = "in",
+  dpi = 300
+)
+
+```
+
+# Incidences
+
+```{r incidences}
+
+# Calculate crude incidence over time for each species and total
+incidence_data <- data %>%
+  group_by(year = year(prøvedato), mikro_kat6) %>%
+  summarise(incidence = n(), .groups = "drop")
+
+# Calculate total incidence
+total_incidence <- data %>%
+  group_by(year = year(prøvedato)) %>%
+  summarise(total = n(), .groups = "drop") %>%
+  mutate(total_scaled = total / 2)  # Scale down to match primary axis
+
+trend_fit <- glm(total ~ year, data = total_incidence, family = poisson)
+trend_p <- summary(trend_fit)$coefficients["year", "Pr(>|z|)"]
+trend_label <- paste0("p for trend < ", formatC(trend_p, format = "f", digits = 3), "1")
+
+incidence_a <- ggplot() +
+  # Add species lines (primary axis)
+  geom_line(data = incidence_data, aes(x = year, y = incidence, color = mikro_kat6), linewidth = 1.5) +
+  scale_color_viridis(discrete = TRUE, name = "Species") +
+  # Add total line (secondary axis) 
+  geom_line(data = total_incidence, aes(x = year, y = total_scaled),
+            color = "grey20", linewidth = 2, linetype = "dashed", alpha = 0.4) +
+  # Add p for trend
+  annotate("text", x = 2020, y = max(total_incidence$total_scaled) * 0.95,
+           label = trend_label, size = 3.5, hjust = 1, vjust = 10, colour = "grey20") +
+  scale_y_continuous(
+    name = "Species incidence",
+    sec.axis = sec_axis(~.*2, name = "Total incidence")
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.y.right = element_text(color = "grey20")
+  ) +
+  scale_x_continuous(breaks = seq(2008, 2024, by = 2))  
+
+incidence_b <- ggplot(data, aes(x = age, fill = mikro_kat6)) +
+  geom_density(position = "fill") +
+  scale_fill_viridis(discrete = TRUE, name = "Species") +
+  labs(x = "Age", y = "Proportion") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = seq(0, 100, by = 10))
+
+incidence_c <- ggplot(data, aes(x = year(prøvedato), fill = mikro_kat6)) +
+  geom_density(position = "fill") +
+  scale_fill_viridis(discrete = TRUE, name = "Species") +
+  labs(x = "Year", y = "Proportion") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = seq(2008, 2024, by = 2))  
+
+# Combine the three graphs vertically with equal heights
+combined_incidence <- (incidence_a / incidence_b / incidence_c) 
+
+# Save the combined plot
+ggsave(
+  "combined_incidence.png",
+  plot = combined_incidence,
+  width = 10,
+  height = 15,
+  units = "in",
+  dpi = 300
+)
+
+```
+
+```{r survival}
+
+comparators <- c(
+  "Candida tropicalis",
+  "Candida glabrata",
+  "Candida parapsilosis",
+  "Others",
+  "Candida krusei"
+)
+
+km_one_vs <- function(df, comparator, use_mikro_kat2 = FALSE) {
+
+  if (use_mikro_kat2) {
+    plot_df <- df %>%
+      filter(mikro_kat2 %in% c("Candida albicans", "Candida non-albicans")) %>%
+      mutate(group = mikro_kat2)
+
+    title <- "Candida albicans vs non-albicans"
+
+  } else {
+    plot_df <- df %>%
+      filter(mikro_kat6 %in% c("Candida albicans", comparator)) %>%
+      mutate(group = mikro_kat6)
+
+    title <- paste("Candida albicans vs", comparator)
+  }
+
+  # Drop comparisons with only one group
+  if (n_distinct(plot_df$group) < 2) return(NULL)
+
+  fit <- survfit(
+    Surv(case_fatality_days, case_fatality) ~ group,
+    data = plot_df
+  )
+  
+  lr <- survdiff(
+    Surv(case_fatality_days, case_fatality) ~ group,
+    data = plot_df
+  )
+  lr_p <- pchisq(lr$chisq, df = length(lr$n) - 1, lower.tail = FALSE)
+  p_label <- paste0("Log-rank p = ", formatC(lr_p, format = "f", digits = 3))
+
+  n_groups <- n_distinct(plot_df$group)
+
+    ggsurvplot(
+    fit,
+    data = plot_df,
+    conf.int = TRUE,
+    legend.title = "Species",
+    palette = viridis(n_groups),
+    title = title,
+    legend.labs = unique(plot_df$group)
+  )$plot +
+    annotate("text", x = max(plot_df$case_fatality_days, na.rm = TRUE) * 0.95,
+             y = 0.05, label = p_label, hjust = 1, size = 3.5)
+}
+
+plots <- Filter(
+  Negate(is.null),
+  c(
+    list(km_one_vs(data, comparator = NULL, use_mikro_kat2 = TRUE)),
+    map(comparators, ~ km_one_vs(data, .x))
+  )
+)
+
+km_plots <- wrap_plots(plots, ncol = 2)
+
+# Save the combined Kaplan-Meier plots
+ggsave(
+  "kaplan_meier_plots.png",
+  plot = km_plots,
+  width = 12,
+  height = 16,
+  units = "in",
+  dpi = 300
+)
+
+```
+
+# Modelling
+
+```{r prepare data}
+
+data_clean_fat <- data %>% select(lopenr, year, case_fatality, age, sex, has_cancer, preterm, transplantation) %>% na.omit()
+data_clean_res <- data %>% select(lopenr, year, resistant, age, sex, has_cancer, preterm, transplantation) %>% na.omit()
+data_clean_alb <- data %>% mutate(mikro_kat2 = ifelse(mikro_kat2=="Candida albicans", 0, 1)) %>% select(lopenr, year, mikro_kat2, age, sex, has_cancer, preterm, transplantation) %>% na.omit()
+
+```
+
+```{r table 3A and figure 1A}
+
+# Run the best model (model_2)
+model_best <- geeglm(case_fatality ~ ns(age, df = 2) + sex + year + has_cancer + preterm + transplantation,
+                    data = data_clean_fat,
+                    family = binomial,
+                    id = lopenr,
+                    corstr = "independence")
+
+# Create predictions at each age point
+age_predictions <- avg_predictions(model_best, newdata = datagrid(age = seq(0, 90, by = 10)),
+                              by = FALSE)
+
+# Plot the spline function
+age_predictions_fine <- avg_predictions(model_best, newdata = datagrid(age = seq(0, 90, by = 1)),
+                              by = FALSE, conf_level = 0.95)
+plot_data <- data.frame(age = seq(0, 90, by = 1),
+                        pred = age_predictions_fine$estimate,
+                        conf.low = age_predictions_fine$conf.low, 
+                        conf.high = age_predictions_fine$conf.high) 
+
+plot_fat <- ggplot(plot_data, aes(x = age, y = pred)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = viridis(1)) +
+  geom_line(color = viridis(1), size = 1) +
+  labs(x = "Age", y = "Predicted probability of case fatality") +
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0, 90, by = 10)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_colour_viridis()
+
+```
+
+```{r table 3B and figure 1B}
+
+# Run the model with natural cubic splines (df = 4)
+model_best_res <- geeglm(resistant ~ ns(age, df = 4) + sex + year + has_cancer + preterm + transplantation,
+                        data = data_clean_res,
+                        family = binomial,
+                        id = lopenr,
+                        corstr = "independence")
+
+# Create predictions at each age point
+age_predictions_res <- avg_predictions(model_best_res, newdata = datagrid(age = seq(0, 90, by = 10)),
+                                  by = FALSE)
+
+# Plot the spline function with finer grid
+age_predictions_fine_res <- avg_predictions(model_best_res, newdata = datagrid(age = seq(0, 90, by = 1)),
+                                       by = FALSE, conf_level = 0.95)
+plot_data_res <- data.frame(age = seq(0, 90, by = 1),
+                            pred = age_predictions_fine_res$estimate,
+                            conf.low = age_predictions_fine_res$conf.low,
+                            conf.high = age_predictions_fine_res$conf.high)
+
+plot_res <- ggplot(plot_data_res, aes(x = age, y = pred)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = viridis(1)) +
+  geom_line(color = viridis(1), size = 1) +
+  labs(x = "Age", y = "Predicted probability of resistance") +
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0, 90, by = 10)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_colour_viridis()
+
+```
+
+```{r table 3C and figure 1C}
+
+# Run the model with natural cubic splines (df = 2)
+model_best_alb <- geeglm(mikro_kat2 ~ ns(age, 2) + sex + year + has_cancer + preterm + transplantation,
+                        data = data_clean_alb,
+                        family = binomial,
+                        id = lopenr,
+                        corstr = "independence")
+
+# Create predictions at each age point
+age_predictions_alb <- avg_predictions(model_best_alb, newdata = datagrid(age = seq(0, 90, by = 10)),
+                                  by = FALSE)
+
+# Plot the spline function with finer grid
+age_predictions_fine_alb <- avg_predictions(model_best_alb, newdata = datagrid(age = seq(0, 90, by = 1)),
+                                       by = FALSE, conf_level = 0.95)
+plot_data_alb <- data.frame(age = seq(0, 90, by = 1),
+                            pred = age_predictions_fine_alb$estimate,
+                            conf.low = age_predictions_fine_alb$conf.low,
+                            conf.high = age_predictions_fine_alb$conf.high)
+
+plot_alb <- ggplot(plot_data_alb, aes(x = age, y = pred)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = viridis(1)) +
+  geom_line(color = viridis(1), size = 1) +
+  labs(x = "Age", y = "Predicted probability of C. non-albicans") +
+  theme_classic() +
+  scale_x_continuous(breaks = seq(0, 90, by = 10)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_colour_viridis()
+
+```
+
+# Collate results
+
+```{r table 3}
+
+# Create a combined table of predictions
+combined_predictions <- data.frame(
+  age = rep(seq(0, 90, by = 10), 3),
+  outcome = rep(c("case_fatality", "resistant", "mikro_kat2"), each = 10),
+  estimate = c(age_predictions$estimate,
+               age_predictions_res$estimate,
+               age_predictions_alb$estimate)
+)
+
+# Create a nicer table
+kable(combined_predictions, caption = "Predicted probabilities at different ages for each outcome",
+      digits = 3, align = c('c', 'l', 'c'))
+
+# Save it
+write.xlsx(combined_predictions,
+           "combined_predictions.xlsx",
+           sheetName = "Predictions",
+           colNames = TRUE,
+           rowNames = FALSE)
+
+```
+
+```{r figure 1}
+
+# Save the combined plots
+ggsave(
+  "modelled_curves.png",
+  plot = (plot_fat / plot_res / plot_alb) +
+    plot_layout(heights = c(24, 24, 24)),
+  width = 10,
+  height = 15,
+  units = "in",
+  dpi = 300
+)
+
+```
+
+```{r model diagnostics}
+
+# Create a function to get model diagnostics
+get_diagnostics <- function(model) {
+  # Get the model data
+  model_data <- model.frame(model)
+
+  # 1. Residual plots
+  plot(resid(model, type = "pearson") ~ fitted(model),
+       main = "Pearson Residuals vs Fitted",
+       xlab = "Fitted values", ylab = "Pearson residuals")
+
+  # 2. VIF for multicollinearity
+  # Note: This is approximate for GEE models and produces warnings about it
+  vif_values <- vif(glm(fitted(model) ~ ., data = model_data, family = binomial))
+  print(vif_values)
+
+  # 3. Goodness-of-fit using DHARMa
+  sim_res <- simulateResiduals(model)
+  plot(sim_res)
+
+  # 4. Predicted vs observed
+  pred_obs <- data.frame(
+    observed = model.response(model.frame(model)),
+    predicted = predict(model, type = "response")
+  )
+  plot(pred_obs$observed ~ pred_obs$predicted,
+       main = "Observed vs Predicted",
+       xlab = "Predicted", ylab = "Observed")
+}
+
+# Apply to each model
+get_diagnostics(model_best)
+get_diagnostics(model_best_res)
+get_diagnostics(model_best_alb)
+
+```
+
+```{r episode analysis}
+
+# Check for multiple episodes, new candidaemias with new species, and new candidaemias with same species
+episode_analysis <- data %>%
+  group_by(lopenr) %>%  # Patient ID
+  summarise(
+    total_episodes = n_distinct(prøvedato),  # Count episodes by sample date
+    unique_species = n_distinct(mikrobe_std),  # Count unique species
+    first_species = first(mikrobe_std)  # Get first species
+  ) %>%
+  mutate(
+    has_multiple_episodes = total_episodes > 1,
+    has_new_species = unique_species > 1
+  ) %>%
+  group_by(has_multiple_episodes, has_new_species) %>%
+  summarise(
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    episode_type = case_when(
+      has_multiple_episodes & has_new_species ~ "Multiple episodes with new species",
+      has_multiple_episodes & !has_new_species ~ "Multiple episodes with same species",
+      !has_multiple_episodes & has_new_species ~ "Single episode with multiple species",
+      !has_multiple_episodes & !has_new_species ~ "Single episode with single species",
+      TRUE ~ "Other"
+    )
+  )
+
+# Print the results
+print(episode_analysis)
+
+```
+
