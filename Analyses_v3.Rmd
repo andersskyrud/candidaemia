@@ -376,12 +376,11 @@ pop_long <- read_delim(
   rename(year = år) %>%
   pivot_longer(-year, names_to = "age_raw", values_to = "pop") %>%
   mutate(
-    age = as.integer(str_extract(age_raw, "\\d+")),
-    age_cat = cut(age, breaks = c(seq(0, 90, by = 10), Inf),
-                  labels = c("0-9", "10-19", "20-29", "30-39", "40-49",
-                             "50-59", "60-69", "70-79", "80-89", "90+"),
-                  right = FALSE)
-  ) %>%
+    age = as.integer(str_extract(age_raw, "\\d+")), 
+    age_cat = cut(age,
+                      breaks = c(0, 1, 40, 65, 80, Inf),
+                      labels = c("<1", "1-39", "40-64", "65-79", "80+"),
+                      right = FALSE)) %>%
   group_by(year, age_cat) %>%
   summarise(pop = sum(pop), .groups = "drop")
 
@@ -523,55 +522,63 @@ comparators <- c(
  
 
 km_one_vs <- function(df, comparator, use_mikro_kat2 = FALSE) {
- 
+
   # Restrict to first episode per patient
   df <- df %>%
     arrange(lopenr, prøvedato) %>%
     distinct(lopenr, .keep_all = TRUE)
- 
+
   if (use_mikro_kat2) {
     plot_df <- df %>%
       filter(mikro_kat2 %in% c("Candida albicans", "Candida non-albicans")) %>%
       mutate(group = mikro_kat2)
-
     title <- "Candida albicans vs non-albicans"
-
   } else {
     plot_df <- df %>%
       filter(mikro_kat6 %in% c("Candida albicans", comparator)) %>%
       mutate(group = mikro_kat6)
-
     title <- paste("Candida albicans vs", comparator)
   }
 
-  # Drop comparisons with only one group
   if (n_distinct(plot_df$group) < 2) return(NULL)
 
-  fit <- survfit(
-    Surv(case_fatality_days, case_fatality) ~ group,
-    data = plot_df
-  )
-  
-  lr <- survdiff(
-    Surv(case_fatality_days, case_fatality) ~ group,
-    data = plot_df
-  )
+    grp_levels <- if (use_mikro_kat2) {
+    c("Candida albicans", "Candida non-albicans")
+  } else {
+    c("Candida albicans", comparator)
+  }
+  plot_df <- plot_df %>%
+    mutate(group = factor(group, levels = grp_levels))
+
+  fit <- survfit(Surv(case_fatality_days, case_fatality) ~ group, data = plot_df)
+  lr  <- survdiff(Surv(case_fatality_days, case_fatality) ~ group, data = plot_df)
   lr_p <- pchisq(lr$chisq, df = length(lr$n) - 1, lower.tail = FALSE)
   p_label <- paste0("Log-rank p = ", formatC(lr_p, format = "f", digits = 3))
 
-  n_groups <- n_distinct(plot_df$group)
-
-    ggsurvplot(
+    gs <- ggsurvplot(
     fit,
-    data = plot_df,
-    conf.int = TRUE,
-    legend.title = "Species",
-    palette = species_colors[unique(plot_df$group)],
-    title = title,
-    legend.labs = unique(plot_df$group)
-  )$plot +
-    annotate("text", x = max(plot_df$case_fatality_days, na.rm = TRUE) * 0.95,
-             y = 0.05, label = p_label, hjust = 1, size = 3.5)
+    data               = plot_df,
+    conf.int           = TRUE,
+    risk.table         = TRUE,
+    risk.table.title   = "Number at risk",
+    risk.table.height  = 0.25,
+    risk.table.y.text  = FALSE,
+    fontsize           = 3,
+    xlim               = c(0, 30),
+    break.time.by      = 5,
+    palette            = unname(species_colors[grp_levels]),
+    legend.title       = "Species",
+    legend.labs        = grp_levels,
+    title              = title
+  )
+
+  # annotation goes on the curve, not the table
+  gs$plot <- gs$plot +
+    annotate("text", x = 30 * 0.95, y = 0.05,
+             label = p_label, hjust = 1, size = 3.5)
+
+  # stack curve over its own risk table as ONE patchwork object
+  gs$plot / gs$table + plot_layout(heights = c(3, 1))
 }
 
 plots <- Filter(
@@ -593,6 +600,26 @@ ggsave(
   units = "in",
   dpi = 300
 )
+
+# --- Thirty-day case fatality over calendar time ---
+
+fatality_year <- data %>%
+  group_by(year = year(prøvedato)) %>%
+  summarise(
+    cases = n(),
+    deaths = sum(case_fatality == 1, na.rm = TRUE),
+    fatality = deaths / cases,
+    .groups = "drop"
+  )
+
+# Trend test
+fatality_trend <- glm(
+  cbind(deaths, cases - deaths) ~ year,
+  data = fatality_year,
+  family = binomial
+)
+
+summary(fatality_trend)
 
 ```
 
@@ -931,6 +958,56 @@ incidence_ec_prop
 ggsave("ec_resistance_proportion.png", incidence_ec_prop,
        width = 10, height = 5, units = "in", dpi = 300)
 
+
+```
+
+```{r appendix 5}
+
+# --- Age-specific candidaemia incidence rates over time (20-year age bands) ---
+
+incidence_age <- ggplot(
+  age_incidence,
+  aes(
+    x = year,
+    y = age_rate,
+    colour = age_cat,
+    group = age_cat
+  )
+) +
+  geom_line(alpha = 0.3, linewidth = 0.8) +
+  geom_smooth(
+    se = FALSE,
+    linewidth = 1.5,
+    method = "loess",
+    span = 0.75
+  ) +
+  scale_colour_viridis_d(
+    option = "plasma",
+    direction = -1,
+    name = "Age group"
+  ) +
+  labs(
+    x = "Year",
+    y = "Incidence per 100,000 population"
+  ) +
+  scale_x_continuous(
+    breaks = seq(2008, 2024, by = 2)
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "right"
+  )
+
+incidence_age
+
+ggsave(
+  "age_specific_incidence_rates.png",
+  plot = incidence_age,
+  width = 10,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
 
 ```
 
